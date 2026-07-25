@@ -1,5 +1,6 @@
 import http from "node:http";
 import { EventEmitter } from "node:events";
+import { timingSafeEqual } from "node:crypto";
 
 export const mcpEvents = new EventEmitter();
 
@@ -105,14 +106,28 @@ function readBody(req) {
 
 export function createMcpServer() {}
 
-export function startMcpHttpServer(port = 0) {
+/** Constant-time bearer check. No token configured = open (login mode, localhost only). */
+export function authorized(req, token) {
+  if (!token) return true;
+  const got = Buffer.from(req.headers.authorization || "");
+  const want = Buffer.from(`Bearer ${token}`);
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+let mcpHitCount = 0;
+
+export function getMcpHitCount() {
+  return mcpHitCount;
+}
+
+export function startMcpHttpServer(port = 0, token = null) {
   return new Promise((resolve, reject) => {
     const httpServer = http.createServer(async (req, res) => {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
       res.setHeader(
         "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, Mcp-Session-Id, Accept"
+        "Content-Type, Authorization, Mcp-Session-Id, Accept, ngrok-skip-browser-warning"
       );
       res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
@@ -124,10 +139,43 @@ export function startMcpHttpServer(port = 0) {
 
       const url = new URL(req.url, "http://localhost");
 
+      // The ngrok URL is public — only Poke (holding the token) may reach /mcp.
+      // Silent: scanners find public tunnels, and each hit would spam the chat.
+      if (url.pathname === "/mcp" && !authorized(req, token)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      // Streamable HTTP: some clients open GET for SSE
+      if (url.pathname === "/mcp" && req.method === "GET") {
+        mcpHitCount++;
+        mcpEvents.emit("traffic", "GET /mcp (sse)");
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        res.write(":\n\n");
+        const keepAlive = setInterval(() => {
+          try { res.write(":\n\n"); } catch { clearInterval(keepAlive); }
+        }, 15000);
+        req.on("close", () => clearInterval(keepAlive));
+        return;
+      }
+
       if (url.pathname === "/mcp" && req.method === "POST") {
         try {
           const body = await readBody(req);
           const parsed = JSON.parse(body);
+          mcpHitCount++;
+
+          const methods = Array.isArray(parsed)
+            ? parsed.map((m) => m.method).filter(Boolean)
+            : [parsed.method].filter(Boolean);
+          if (methods.length) {
+            mcpEvents.emit("traffic", methods.join(", "));
+          }
 
           if (Array.isArray(parsed)) {
             const results = parsed.map(handleJsonRpc).filter(Boolean);
@@ -153,7 +201,7 @@ export function startMcpHttpServer(port = 0) {
 
       if (url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
+        res.end(JSON.stringify({ status: "ok", hits: mcpHitCount }));
         return;
       }
 

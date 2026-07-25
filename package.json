@@ -1,10 +1,10 @@
 {
-  "name": "poke-tui",
-  "version": "0.0.6",
-  "description": "Chat with your Poke AI assistant from the terminal",
+  "name": "poke-tui-ngrok",
+  "version": "0.0.7",
+  "description": "Chat with your Poke AI assistant from the terminal (API key + sticky ngrok MCP)",
   "type": "module",
   "bin": {
-    "poke-tui": "./bin/poke-tui.js"
+    "poke-tui-ngrok": "bin/poke-tui.js"
   },
   "scripts": {
     "start": "node src/app.js"
@@ -24,6 +24,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@ngrok/ngrok": "^1.7.0",
     "ink": "^6.8.0",
     "ink-text-input": "^6.0.0",
     "poke": "^0.4.2",

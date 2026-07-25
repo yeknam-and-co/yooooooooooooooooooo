@@ -1,7 +1,8 @@
-import { Poke, PokeTunnel, login, isLoggedIn, getToken } from "poke";
+import { Poke, PokeTunnel, getToken } from "poke";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { loadConfig, updateConfig } from "./config.js";
 
 const REPLY_INSTRUCTION =
   "[TERMINAL SESSION — MANDATORY]\n" +
@@ -13,11 +14,26 @@ const REPLY_INSTRUCTION =
   "ONLY call reply_to_terminal. NOTHING else. No chat message. Zero words in chat.\n" +
   "[END TERMINAL SESSION]\n\n";
 
+const TERMINAL_WEBHOOK_CONDITION =
+  "When a message arrives from poke-tui terminal (source=poke-tui)";
+
+const TERMINAL_WEBHOOK_ACTION =
+  "The user is chatting from their TERMINAL ONLY (poke-tui). " +
+  "Read `message` from the webhook payload. " +
+  "Respond ONLY by calling the reply_to_terminal MCP tool with your full answer. " +
+  "DO NOT reply via iMessage, SMS, Telegram, or any chat text. " +
+  "Leave the chat/message reply completely empty. " +
+  "ONLY call reply_to_terminal — nothing else.";
+
 const CONFIG_DIR = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
 const STATE_PATH = join(CONFIG_DIR, "poke-tui", "state.json");
 
 function loadState() {
-  try { return JSON.parse(readFileSync(STATE_PATH, "utf-8")); } catch { return {}; }
+  try {
+    return JSON.parse(readFileSync(STATE_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
 }
 
 function saveState(state) {
@@ -26,19 +42,33 @@ function saveState(state) {
 }
 
 export class PokeClient {
-  constructor({ apiKey, onEvent }) {
+  constructor({ apiKey, authMode = "api-key", onEvent }) {
     this.apiKey = apiKey;
+    this.authMode = authMode; // "login" | "api-key"
     this.onEvent = onEvent || (() => {});
     this.poke = null;
+    this.mcpUrl = null;
+    this.localMcpUrl = null;
+    this.connected = false;
+    this.webhooks = [];
+    this.terminalWebhook = null;
     this.tunnel = null;
     this.tunnelInfo = null;
-    this.webhooks = [];
   }
 
   async init(mcpPort) {
     this.poke = new Poke({ apiKey: this.apiKey });
-    this.mcpUrl = `http://localhost:${mcpPort}/mcp`;
+    this.localMcpUrl = `http://localhost:${mcpPort}/mcp`;
     this.onEvent("status", "SDK initialized");
+  }
+
+  setMcpUrl(url) {
+    this.mcpUrl = url;
+  }
+
+  setConnected(connected) {
+    this.connected = connected;
+    this.onEvent(connected ? "mcp-connected" : "mcp-disconnected");
   }
 
   async cleanupOldConnection() {
@@ -54,30 +84,33 @@ export class PokeClient {
     } catch {}
   }
 
-  async startTunnel(mcpPort) {
-    const token = getToken();
-    if (!token && !this.apiKey) {
-      this.onEvent("error", "Not logged in. Run `poke login` first or set POKE_API_KEY.");
-      return;
+  /** Official Poke tunnel (requires poke login session). */
+  async startPokeTunnel() {
+    const token = getToken() || this.apiKey;
+    if (!token) {
+      throw new Error("Not logged in. Run poke login or choose API key mode.");
     }
 
     await this.cleanupOldConnection();
 
     this.tunnel = new PokeTunnel({
-      url: this.mcpUrl,
+      url: this.localMcpUrl,
       name: "Poke TUI Terminal",
-      token: token || this.apiKey,
+      token,
       cleanupOnStop: false,
     });
 
     this.tunnel.on("connected", (info) => {
       this.tunnelInfo = info;
+      this.mcpUrl = info.tunnelUrl || this.localMcpUrl;
       saveState({ connectionId: info.connectionId });
+      this.setConnected(true);
       this.onEvent("tunnel-connected", info);
     });
 
     this.tunnel.on("disconnected", () => {
       this.tunnelInfo = null;
+      this.setConnected(false);
       this.onEvent("tunnel-disconnected");
     });
 
@@ -85,31 +118,57 @@ export class PokeClient {
       this.onEvent("tunnel-error", err.message);
     });
 
-    this.tunnel.on("toolsSynced", ({ toolCount }) => {
-      this.onEvent("tools-synced", toolCount);
-    });
-
-    this.tunnel.on("oauthRequired", ({ authUrl }) => {
-      this.onEvent("oauth-required", authUrl);
-    });
-
-    try {
-      const info = await this.tunnel.start();
-      // Explicitly sync tools right after tunnel connects —
-      // activateTunnel() syncs server-side but doesn't emit the event
-      setTimeout(() => this.syncTools(), 2000);
-      return info;
-    } catch (err) {
-      this.onEvent("tunnel-error", err.message);
-      throw err;
-    }
+    const info = await this.tunnel.start();
+    return info;
   }
 
-  async sendMessage(text) {
+  async ensureTerminalWebhook() {
     if (!this.poke) throw new Error("SDK not initialized");
-    const fullText = REPLY_INSTRUCTION + text;
-    const res = await this.poke.sendMessage(fullText);
-    return res;
+
+    const cfg = loadConfig();
+    const saved = cfg.terminalWebhook;
+    if (saved?.webhookUrl && saved?.webhookToken) {
+      this.terminalWebhook = saved;
+      return saved;
+    }
+
+    const webhook = await this.poke.createWebhook({
+      condition: TERMINAL_WEBHOOK_CONDITION,
+      action: TERMINAL_WEBHOOK_ACTION,
+    });
+
+    const stored = {
+      triggerId: webhook.triggerId,
+      webhookUrl: webhook.webhookUrl,
+      webhookToken: webhook.webhookToken,
+    };
+
+    updateConfig({ terminalWebhook: stored });
+    this.terminalWebhook = stored;
+    return stored;
+  }
+
+  /** Chat: webhook for api-key mode, sendMessage for login mode. */
+  async sendChat(text) {
+    if (!this.poke) throw new Error("SDK not initialized");
+
+    if (this.authMode === "login") {
+      return this.poke.sendMessage(REPLY_INSTRUCTION + text);
+    }
+
+    if (!this.terminalWebhook) {
+      await this.ensureTerminalWebhook();
+    }
+
+    return this.poke.sendWebhook({
+      webhookUrl: this.terminalWebhook.webhookUrl,
+      webhookToken: this.terminalWebhook.webhookToken,
+      data: {
+        source: "poke-tui",
+        channel: "terminal",
+        message: text,
+      },
+    });
   }
 
   async createWebhook({ condition, action }) {
@@ -134,41 +193,14 @@ export class PokeClient {
     });
   }
 
-  async syncTools() {
-    if (!this.tunnel) return;
-    try {
-      // Access the tunnel's internal syncTools via the same API call
-      const { PokeTunnel } = await import("poke");
-      const fetchWithAuth = (await import("poke")).PokeAuthError; // just to trigger import
-      const token = (await import("poke")).getToken();
-      const baseUrl = process.env.POKE_API ?? "https://poke.com/api/v1";
-      const connId = this.tunnel.info?.connectionId;
-      if (!connId) return;
-
-      const res = await fetch(`${baseUrl}/mcp/connections/${connId}/sync-tools`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token || this.apiKey}`,
-        },
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const toolCount = Array.isArray(data.tools) ? data.tools.length : 0;
-        this.onEvent("tools-synced", toolCount);
-      } else {
-        this.onEvent("error", `Sync tools failed: HTTP ${res.status}`);
-      }
-    } catch (err) {
-      this.onEvent("error", `Sync tools error: ${err.message}`);
-    }
-  }
-
   async stop() {
     if (this.tunnel) {
       try {
         await this.tunnel.stop();
       } catch {}
+      this.tunnel = null;
     }
+    this.connected = false;
+    this.mcpUrl = null;
   }
 }
